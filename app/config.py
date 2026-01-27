@@ -12,7 +12,8 @@ class RAGConfig:
 
     min_score_faq_to_answer: float
     min_score_articles_to_answer: float
-
+    overwrite: float
+    
     openai_model: str
     openai_embed_model: str
     temperature: float
@@ -30,7 +31,8 @@ class RAGConfig:
             top_k_articles=int(os.getenv("TOP_K_ARTICLES", "8")),
             min_score_faq_to_answer=float(os.getenv("MIN_SCORE_FAQ", "0.80")),
             min_score_articles_to_answer=float(os.getenv("MIN_SCORE_ARTICLES", "0.75")),
-            openai_model=os.getenv("OPENAI_MODEL", "gpt-4.1-mini"),
+            overwrite=float(os.getenv("OVERWRITE","0.92")),
+            openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
             openai_embed_model=os.getenv("OPENAI_EMBED_MODEL", "text-embedding-3-large"),
             temperature=float(os.getenv("OPENAI_TEMPERATURE", "0.0")),
             max_context_chars=int(os.getenv("MAX_CONTEXT_CHARS", "12000")),
