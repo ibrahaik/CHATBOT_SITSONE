@@ -10,8 +10,8 @@ from app.utils import is_stale, safe_str
 class Decision:
     action: str  # "answer" | "clarify"
     reason: str
+    source_kind: str  # "faq" | "article" | "none"
     caution_note: Optional[str] = None
-    citation_hint: Optional[str] = None
 
 
 class PolicyDecider:
@@ -19,61 +19,62 @@ class PolicyDecider:
         self.cfg = cfg
 
     def decide(self, question: str, lang: str, faqs: List[RetrievedItem], arts: List[RetrievedItem]) -> Decision:
-
-        # Override: si un artículo es extremadamente relevante, priorízalo siempre
-        # (idealmente cfg.min_score_articles_override = 0.92 o 0.95)
         override_thr = self.cfg.overwrite
-        if arts and arts[0].score >= override_thr:
+
+        top_faq = faqs[0] if faqs else None
+        top_art = arts[0] if arts else None
+
+        # 1) Artículos override si son súper relevantes
+        if top_art and top_art.score >= override_thr:
             return Decision(
                 action="answer",
                 reason="articles_override",
-                caution_note=self._caution_if_stale(arts[0], lang),
-                citation_hint=self._cite_brief(arts[0], lang),
+                source_kind="article",
+                caution_note=self._caution_if_stale(top_art, lang),
             )
 
-        # Flujo normal: FAQ primero si supera umbral
-        if faqs and faqs[0].score >= self.cfg.min_score_faq_to_answer:
+        # 2) FAQ si pasa umbral (rápido, sin juez si ya es muy claro)
+        if top_faq and top_faq.score >= self.cfg.min_score_faq_to_answer:
             return Decision(
                 action="answer",
                 reason="faq_confident",
-                caution_note=self._caution_if_stale(faqs[0], lang),
-                citation_hint=self._cite_brief(faqs[0], lang),
+                source_kind="faq",
+                caution_note=self._caution_if_stale(top_faq, lang),
             )
 
-        # Fallback: artículos si superan su umbral
-        if arts and arts[0].score >= self.cfg.min_score_articles_to_answer:
+        # 3) Artículos si pasan umbral
+        if top_art and top_art.score >= self.cfg.min_score_articles_to_answer:
             return Decision(
                 action="answer",
                 reason="articles_confident",
-                caution_note=self._caution_if_stale(arts[0], lang),
-                citation_hint=self._cite_brief(arts[0], lang),
+                source_kind="article",
+                caution_note=self._caution_if_stale(top_art, lang),
             )
 
-        return Decision(action="answer", reason="low_signal")
+        # 4) NUEVO: si hay FAQs recuperadas, intenta el pipeline de juez
+        # (El juez decidirá si hay evidencia; si no, chatbot degradará a clarify).
+        if faqs:
+            return Decision(
+                action="answer",
+                reason="faq_try_judge_low_score",
+                source_kind="faq",
+                caution_note=self._caution_if_stale(top_faq, lang) if top_faq else None,
+            )
+
+        # 5) Si no hay nada, clarify
+        return Decision(
+            action="clarify",
+            reason="low_signal_no_candidates",
+            source_kind="none",
+            caution_note=None,
+        )
 
     def _caution_if_stale(self, item: RetrievedItem, lang: str) -> Optional[str]:
         upd = safe_str(item.meta.get("updatedAt"))
         if upd and is_stale(upd, self.cfg.stale_days_warn):
-            return (
-                "Això pot haver canviat; si tens dubtes, confirma-ho amb la versió actual."
-                if lang == "ca"
-                else "Esto puede haber cambiado; si tienes dudas, confírmalo con la versión actual."
-            )
+            if lang == "ca":
+                return "Això pot haver canviat; si tens dubtes, confirma-ho amb la versió actual."
+            if lang == "en":
+                return "This may have changed; if in doubt, please confirm with the latest version."
+            return "Esto puede haber cambiado; si tienes dudas, confírmalo con la versión actual."
         return None
-
-    def _cite_brief(self, item: RetrievedItem, lang: str) -> str:
-        if item.source == "faq":
-            title = safe_str(
-                item.meta.get("titulo")
-                or item.meta.get("title")
-                or item.meta.get("faq_id")
-                or item.meta.get("id")
-                or ""
-            )
-            return (f"Font: FAQ {title}" if lang == "ca" else f"Fuente: FAQ {title}").strip()
-
-        titulo = safe_str(item.meta.get("titulo") or item.meta.get("article_id") or item.meta.get("id") or "")
-        bloc = safe_str(item.meta.get("block_title") or "")
-        if lang == "ca":
-            return (f"Font: Wiki “{titulo}” — Bloc “{bloc}”" if bloc else f"Font: Wiki “{titulo}”")
-        return (f"Fuente: Wiki “{titulo}” — Bloque “{bloc}”" if bloc else f"Fuente: Wiki “{titulo}”")
