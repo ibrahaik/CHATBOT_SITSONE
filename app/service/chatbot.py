@@ -1,9 +1,10 @@
+# app/chatbot.py
 from typing import Any, Dict, List, Optional
 import re
 
 from app.config import RAGConfig
 from app.retrieval.retriever import Retriever
-from app.policy.decider import PolicyDecider
+from app.policy.decider import PolicyDecider, Decision
 from app.context import ContextBuilder
 from app.prompt import LLMResponder
 from app.utils import detect_language, safe_str, parse_iso
@@ -32,33 +33,49 @@ def _faq_theme_until_first_dot(question: str) -> str:
 
 
 def _faq_ref(meta: Dict[str, Any]) -> str:
-    if meta.get("faq_id"):
-        return meta["faq_id"]
-    if meta.get("source_row") is not None:
-        return f"row {meta['source_row']}"
-    if meta.get("fingerprint"):
-        return f"fp {meta['fingerprint'][:10]}"
+    fid = safe_str(meta.get("faq_id")).strip()
+    if fid:
+        return fid
+    row = meta.get("source_row")
+    if row is not None and str(row).strip():
+        return f"row {row}"
+    fp = safe_str(meta.get("fingerprint")).strip()
+    if fp:
+        return f"fp {fp[:10]}"
     return ""
 
 
-def _pick_source_line(lang: str, decision, faqs: list, arts: list) -> str:
+def _pick_source_line(lang: str, decision: Decision, faqs: list, arts: list) -> str:
     if decision.source_kind == "faq" and faqs:
         meta = faqs[0].meta or {}
         base = "Font: FAQ" if lang == "ca" else "Source: FAQ" if lang == "en" else "Fuente: FAQ"
         ref = _faq_ref(meta)
-        theme = _faq_theme_until_first_dot(meta.get("question", ""))
-        return f"{base} {ref} — {theme}".strip(" —")
+        theme = _faq_theme_until_first_dot(safe_str(meta.get("question")))
+        out = base
+        if ref:
+            out += f" {ref}"
+        if theme:
+            out += f" — {theme}"
+        return out.strip()
 
     if decision.source_kind == "article" and arts:
         meta = arts[0].meta or {}
-        titulo = safe_str(meta.get("titulo"))
-        ym = _ym(meta.get("updatedAt"))
-        base = (
-            f"Font: Wiki “{titulo}”" if lang == "ca"
-            else f"Source: Wiki “{titulo}”" if lang == "en"
-            else f"Fuente: Wiki “{titulo}”"
-        )
-        return f"{base} — {ym}".strip(" —")
+        titulo = safe_str(meta.get("titulo")).strip()
+        ym = _ym(safe_str(meta.get("updatedAt")))
+        if lang == "ca":
+            base = f'Font: Wiki “{titulo}”' if titulo else "Font: Wiki"
+            if ym:
+                base += f" — actualitzat {ym}"
+            return base.strip()
+        if lang == "en":
+            base = f'Source: Wiki “{titulo}”' if titulo else "Source: Wiki"
+            if ym:
+                base += f" — updated {ym}"
+            return base.strip()
+        base = f'Fuente: Wiki “{titulo}”' if titulo else "Fuente: Wiki"
+        if ym:
+            base += f" — actualizado {ym}"
+        return base.strip()
 
     return ""
 
@@ -67,24 +84,71 @@ _SOURCE_LINE_RE = re.compile(r"(?im)^\s*(Fuente|Font|Source)\s*:\s*.*\s*$")
 
 
 def _enforce_source_line(answer: str, source_line: str) -> str:
-    if not source_line:
-        return answer.strip()
-    clean = _SOURCE_LINE_RE.sub("", answer or "").strip()
-    return f"{clean}\n\n{source_line}".strip()
+    ans = (answer or "").strip()
+    src = (source_line or "").strip()
+    if not src:
+        return ans
+    ans = _SOURCE_LINE_RE.sub("", ans).strip()
+    return f"{ans}\n\n{src}".strip() if ans else src
 
 
-def _extract_debug_matches(items: list, kind: str, limit: int) -> List[Dict[str, Any]]:
+def _extract_debug_faqs(items: list, kind: str, limit: int) -> List[Dict[str, Any]]:
     out = []
     for it in (items or [])[:limit]:
         meta = it.meta or {}
         out.append({
             "kind": kind,
-            "score": it.score,
-            "faq_id": meta.get("faq_id"),
+            "score": float(it.score or 0.0),
             "question": meta.get("question"),
             "text_preview": _clip(it.text, 260),
         })
     return out
+
+
+def _extract_debug_articles(items: list, kind: str, limit: int) -> List[Dict[str, Any]]:
+    out = []
+    for it in (items or [])[:limit]:
+        meta = it.meta or {}
+        out.append({
+            "kind": kind,
+            "score": float(it.score or 0.0),
+            "titulo": meta.get("titulo"),
+            "chunk_index": meta.get("chunk_index"),
+            "block_id": meta.get("block_id"),
+            "text_preview": _clip(it.text, 260),
+        })
+    return out
+
+
+# --------- NUEVO: helpers de tema/pantalla ---------
+
+_SCREEN_RE = re.compile(r"(?:pantalla|screen)\s+([^\n\?]+)", re.IGNORECASE)
+
+def _extract_screen_name(text: str) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # Caso explícito "pantalla X"
+    m = _SCREEN_RE.search(t)
+    if m:
+        return m.group(1).strip(" \"'”")
+
+    # Heurística mínima (NO inventar): si el texto menciona claramente el nombre
+    tl = t.lower()
+    if "gestió" in tl and "lliur" in tl:
+        return "Gestió de lliuraments"
+
+    return ""
+
+
+def _should_update_topic(q: str) -> bool:
+    ql = (q or "").lower()
+    # Solo si hay señal de "tema real", no por longitud
+    return any(k in ql for k in ["pantalla", "mòdul", "módulo", "gestió", "gestio", "lliur", "provisionals"])
+
+
+# --------------------------------------------------
 
 
 class ChatbotService:
@@ -106,20 +170,23 @@ class ChatbotService:
         self.faq_judge = faq_judge
         self.query_rewriter = query_rewriter
 
-    def handle_messages(
-        self,
-        messages: List[Dict[str, str]],
-        state: Optional[Dict[str, Any]] = None,
-    ) -> Dict[str, Any]:
-
+    def handle_messages(self, messages: List[Dict[str, str]], state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         state = dict(state or {})
+
         last_user = self._last_user_message(messages)
         lang = detect_language(last_user)
 
+        # root_question solo una vez
         if last_user and not state.get("root_question"):
             state["root_question"] = last_user
 
-        if last_user and len(last_user.split()) > 4:
+        # screen_hint persistente si lo detectamos
+        detected_screen = _extract_screen_name(last_user) or _extract_screen_name(state.get("last_bot", ""))
+        if detected_screen:
+            state["screen_hint"] = detected_screen
+
+        # topic_question: NO se pisa con “ahí/esto”
+        if last_user and _should_update_topic(last_user):
             state["topic_question"] = last_user
 
         last_bot = self._last_bot_message(messages)
@@ -129,54 +196,74 @@ class ChatbotService:
         state["last_user"] = last_user
         memory = self._build_memory_text(state)
 
+        # --------- NUEVO: rewriter siempre salvo primer turno ---------
+        is_first_turn = not bool(state.get("last_bot"))  # si no hay last_bot, asumimos 1er turno real
         effective_question = last_user
+        rewrite_used = False
 
-        res = self.retriever.retrieve(effective_question)
-        faqs, arts = res["faqs"], res["articles"]
-        decision = self.decider.decide(effective_question, lang, faqs, arts)
-
-        if decision.action == "clarify" and state.get("topic_question"):
+        if not is_first_turn:
             effective_question = self.query_rewriter.rewrite(
                 last_user=last_user,
-                topic_question=state.get("topic_question"),
-                last_bot=state.get("last_bot"),
+                topic_question=state.get("topic_question") or "",
+                last_bot=state.get("last_bot") or "",
                 lang=lang,
+                screen_hint=state.get("screen_hint") or "",
+                root_question=state.get("root_question") or "",
             )
-            res = self.retriever.retrieve(effective_question)
-            faqs, arts = res["faqs"], res["articles"]
-            decision = self.decider.decide(effective_question, lang, faqs, arts)
+            rewrite_used = True
+        # ------------------------------------------------------------
 
-        selected_faqs = []
-        judge_debug = None
+        # 1) retrieval usando effective_question (reescrita)
+        res = self.retriever.retrieve(effective_question, expand_articles=False)
+        faqs, arts = res["faqs"], res["articles"]
+        arts_global = list(arts)  # <-- NUEVO snapshot
+        decision = self.decider.decide(effective_question, lang, faqs, arts)
+
+        # 2) judge FAQs (solo si el decider eligió FAQ)
+        selected_faqs: List[Any] = []
+        judge_debug: Optional[Dict[str, Any]] = None
 
         if decision.source_kind == "faq" and faqs:
-            candidates = [
-                {
-                    "id": it.meta.get("faq_id"),
-                    "question": it.meta.get("question"),
-                    "answer": it.text,
-                }
-                for it in faqs[: self.cfg.top_k_faq_candidates]
-                if it.meta.get("faq_id")
-            ]
+            candidates = []
+            for it in faqs[: self.cfg.top_k_faq_candidates]:
+                fid = safe_str((it.meta or {}).get("faq_id")).strip()
+                if not fid:
+                    continue
+                candidates.append({
+                    "id": fid,
+                    "question": safe_str((it.meta or {}).get("question")),
+                    "answer": safe_str(it.text),
+                })
 
-            judge_res = self.faq_judge.select(last_user, candidates, lang)
+            # ✅ CLAVE: el judge debe ver la pregunta efectiva (con pantalla)
+            judge_res = self.faq_judge.select(effective_question, candidates, lang)
             ids = set(judge_res.selected_ids)
 
             selected_faqs = [
                 it for it in faqs
-                if it.meta.get("faq_id") in ids
+                if safe_str((it.meta or {}).get("faq_id")).strip() in ids
             ][: self.cfg.top_k_faq_final]
 
             judge_debug = {
                 "selected_ids": judge_res.selected_ids,
                 "confidence": judge_res.confidence,
+                "reason": judge_res.reason,
+                "candidates_count": len(candidates),
+                "selected_count": len(selected_faqs),
             }
 
+            # Si el juez no ve evidencia, usamos top FAQs sin cambiar la decision
             if not selected_faqs:
-                decision.action = "clarify"
-                decision.source_kind = "none"
+                selected_faqs = faqs[: self.cfg.top_k_faq_final]
+                if judge_debug is not None:
+                    judge_debug["fallback_used"] = True
 
+        arts_expanded = []
+        if decision.source_kind == "article":
+            arts_expanded = self.retriever.expand_articles(effective_question, arts)
+            arts = arts_expanded
+
+        # context según decisión final
         faqs_for_ctx = selected_faqs if decision.source_kind == "faq" else []
         arts_for_ctx = arts if decision.source_kind == "article" else []
 
@@ -191,7 +278,7 @@ class ChatbotService:
         source_line = _pick_source_line(lang, decision, faqs_for_ctx, arts_for_ctx)
 
         raw_answer = self.llm.run(
-            last_user,
+            last_user,  # OJO: aquí mantengo last_user para responder al usuario como tal
             lang,
             rag_context,
             decision,
@@ -199,52 +286,55 @@ class ChatbotService:
             source_line=source_line,
         )
 
-        answer = (
-            _enforce_source_line(raw_answer, source_line)
-            if rag_context and source_line
-            else raw_answer.strip()
-        )
-
+        answer = _enforce_source_line(raw_answer, source_line) if (rag_context and source_line) else (raw_answer or "").strip()
         state["last_bot"] = answer
 
         return {
             "language": lang,
-            "decision": {
-                "action": decision.action,
-                "reason": decision.reason,
-                "source_kind": decision.source_kind,
-            },
+            "decision": {"action": decision.action, "reason": decision.reason, "source_kind": decision.source_kind},
             "answer": answer,
             "state": state,
             "debug": {
+                "original_last_user": last_user,
                 "effective_question": effective_question,
+                "rewrite_used": rewrite_used,
+                "screen_hint": state.get("screen_hint"),
+                "topic_question": state.get("topic_question"),
                 "faq_judge": judge_debug,
-                "retrieval": {
-                    "faqs": _extract_debug_matches(faqs, "faq", self.cfg.top_k_faq_candidates),
-                    "articles": _extract_debug_matches(arts, "article", self.cfg.top_k_articles_final),
+                "faqs": {
+                    "candidates": _extract_debug_faqs(faqs, "faq", self.cfg.top_k_faq_candidates),
+                    "selected": _extract_debug_faqs(faqs_for_ctx, "faq_selected", self.cfg.top_k_faq_final),
                 },
+                "articles": {
+                "global_candidates": _extract_debug_articles(arts_global, "article_global", self.cfg.top_k_articles_candidates),
+                "expanded_pool": _extract_debug_articles(arts_expanded, "article_expanded", self.cfg.top_k_articles_final),
+                "cited_chunks": _extract_debug_articles(arts_for_ctx, "article_cited", self.cfg.top_k_articles_final),
+},
+
             },
         }
 
     def _build_memory_text(self, state: Dict[str, Any]) -> str:
         parts = ["MEMORIA (último hilo):"]
         if state.get("root_question"):
-            parts.append(f"- Pregunta raíz: {state['root_question']}")
+            parts.append(f"- Pregunta raíz: {_clip(state['root_question'], 280)}")
+        if state.get("screen_hint"):
+            parts.append(f"- Pantalla/tema: {_clip(state['screen_hint'], 140)}")
         if state.get("last_bot"):
-            parts.append(f"- Última respuesta del bot: {state['last_bot']}")
+            parts.append(f"- Última respuesta del bot: {_clip(state['last_bot'], 420)}")
         if state.get("last_user"):
-            parts.append(f"- Último mensaje del usuario: {state['last_user']}")
-        return "\n".join(parts)
+            parts.append(f"- Último mensaje del usuario: {_clip(state['last_user'], 280)}")
+        return "\n".join(parts).strip()
 
     def _last_user_message(self, messages: List[Dict[str, str]]) -> str:
         for m in reversed(messages or []):
-            if m.get("role") == "user" and m.get("content"):
+            if m.get("role") == "user" and (m.get("content") or "").strip():
                 return m["content"].strip()
         return ""
 
     def _last_bot_message(self, messages: List[Dict[str, str]]) -> str:
         for m in reversed(messages or []):
-            if m.get("role") in ("assistant", "bot") and m.get("content"):
+            if m.get("role") in ("assistant", "bot") and (m.get("content") or "").strip():
                 return m["content"].strip()
         return ""
 
@@ -259,15 +349,8 @@ def build_app(cfg: RAGConfig) -> ChatbotService:
     decider = PolicyDecider(cfg)
     ctx_builder = ContextBuilder(cfg)
     llm = LLMResponder(cfg, client)
+
     faq_judge = FAQJudge(client=client, model=cfg.judge_model)
     query_rewriter = QueryRewriter(client=client, model=cfg.judge_model)
 
-    return ChatbotService(
-        cfg,
-        retriever,
-        decider,
-        ctx_builder,
-        llm,
-        faq_judge,
-        query_rewriter,
-    )
+    return ChatbotService(cfg, retriever, decider, ctx_builder, llm, faq_judge, query_rewriter)

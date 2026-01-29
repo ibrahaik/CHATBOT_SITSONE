@@ -33,6 +33,11 @@ class RAGConfig:
     top_k_faq_final: int
     
     judge_model: str
+    
+    top_k_articles_within_article: int
+    article_neighbor_window: int
+    article_min_chunks: int
+
 
     @staticmethod
     def from_env() -> "RAGConfig":
@@ -63,5 +68,10 @@ class RAGConfig:
             top_k_faq_candidates=int(os.getenv("TOP_K_FAQ_CANDIDATES", "25")),
             top_k_faq_final=int(os.getenv("TOP_K_FAQ_FINAL", "5")),
             judge_model=os.getenv("JUDGE_MODEL", os.getenv("OPENAI_MODEL", "gpt-4o-mini")),
+            
+            top_k_articles_within_article=int(os.getenv("TOP_K_ARTICLES_WITHIN_ARTICLE", "30")),
+            article_neighbor_window=int(os.getenv("ARTICLE_NEIGHBOR_WINDOW", "1")),
+            article_min_chunks=int(os.getenv("ARTICLE_MIN_CHUNKS", "3")),
+
 
         )

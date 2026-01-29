@@ -1,3 +1,4 @@
+# app/clients/pinecone_gateway.py
 from typing import Any, Dict, List, Optional
 import os
 
@@ -26,15 +27,29 @@ class PineconeGateway:
             include_metadata=include_metadata,
             filter=flt or None,
         )
-        matches = res.get("matches") or []
+
+        # ✅ robusto: res puede ser dict o objeto con atributo .matches
+        matches = None
+        if hasattr(res, "matches"):
+            matches = getattr(res, "matches")
+        elif isinstance(res, dict):
+            matches = res.get("matches")
+
+        matches = matches or []
+
         out: List[Dict[str, Any]] = []
         for m in matches:
-            out.append({
-                "id": m.get("id"),
-                "score": float(m.get("score") or 0.0),
-                "metadata": m.get("metadata") or {},
-            })
+            # m puede ser dict o objeto con atributos
+            if isinstance(m, dict):
+                out.append({
+                    "id": m.get("id"),
+                    "score": float(m.get("score") or 0.0),
+                    "metadata": m.get("metadata") or {},
+                })
+            else:
+                out.append({
+                    "id": getattr(m, "id", None),
+                    "score": float(getattr(m, "score", 0.0) or 0.0),
+                    "metadata": getattr(m, "metadata", None) or {},
+                })
         return out
-
-    def fetch(self, namespace: str, ids: List[str]) -> Dict[str, Any]:
-        return self.index.fetch(namespace=namespace, ids=ids)

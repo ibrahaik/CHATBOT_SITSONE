@@ -48,7 +48,6 @@ def user_prompt(question: str, context: str, decision: Decision, memory: str = "
         f"- Mode: {decision.action}\n"
         f"{caution_line}"
         f"{source_line_line}"
-        f"- Si usas CONTEXTO, termina con EXACTAMENTE la línea source_line.\n"
         f"- Si NO usas CONTEXTO, NO pongas 'Fuente:' / 'Font:'.\n"
     ).strip()
 

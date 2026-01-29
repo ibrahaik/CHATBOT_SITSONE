@@ -3,6 +3,14 @@ from app.config import RAGConfig
 from app.retrieval.models import RetrievedItem
 from app.utils import safe_str
 
+def _to_int(x, default=None):
+    try:
+        if x is None:
+            return default
+        return int(str(x).strip())
+    except Exception:
+        return default
+
 class ContextBuilder:
     def __init__(self, cfg: RAGConfig):
         self.cfg = cfg
@@ -19,17 +27,30 @@ class ContextBuilder:
         return out[: self.cfg.max_context_chars].strip()
 
     def build_articles(self, arts: List[RetrievedItem]) -> str:
+        # orden estable por article_id + chunk_index
+        def sort_key(it: RetrievedItem):
+            m = it.meta or {}
+            aid = safe_str(m.get("article_id"))
+            idx = _to_int(m.get("chunk_index"), default=10**9)
+            return (aid, idx)
+
+        arts = sorted(arts or [], key=sort_key)
+
         parts: List[str] = []
         if arts:
             parts.append("Articles:")
             for i, it in enumerate(arts[: self.cfg.top_k_articles_final], start=1):
-                titulo = safe_str(it.meta.get("titulo") or "")
-                bloc = safe_str(it.meta.get("block_title") or "")
-                bdef = safe_str(it.meta.get("block_definition") or "")
-                role = safe_str(it.meta.get("chunk_role") or "")
-                txt = it.text
+                m = it.meta or {}
+                titulo = safe_str(m.get("titulo") or "")
+                bloc = safe_str(m.get("block_title") or "")
+                bdef = safe_str(m.get("block_definition") or "")
+                role = safe_str(m.get("chunk_role") or "")
+                idx = safe_str(m.get("chunk_index") or "")
+                aid = safe_str(m.get("article_id") or "")
 
-                header = f"- [A{i}] Títol: {titulo}".strip()
+                header = f"- [A{i}] article_id={aid} chunk_index={idx}".strip()
+                if titulo:
+                    header += f" | Títol: {titulo}"
                 if bloc:
                     header += f" | Bloc: {bloc}"
                 if role:
@@ -37,7 +58,7 @@ class ContextBuilder:
                 if bdef:
                     header += f" | Definició bloc: {bdef}"
                 parts.append(header)
-                parts.append(f"  Text: {txt}".strip())
+                parts.append(f"  Text: {it.text}".strip())
 
         out = "\n".join([p for p in parts if p.strip()]).strip()
         return out[: self.cfg.max_context_chars].strip()

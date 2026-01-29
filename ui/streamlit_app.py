@@ -15,7 +15,7 @@ from app.service.chatbot import build_app  # ajusta si tu archivo se llama disti
 load_dotenv("app/.env")
 
 st.set_page_config(page_title="AMB Wiki", page_icon="💬", layout="centered")
-st.title("AMB")
+st.title("AMB PRE")
 
 cfg = RAGConfig.from_env()
 app = build_app(cfg)
