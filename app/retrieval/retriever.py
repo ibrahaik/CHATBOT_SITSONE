@@ -1,4 +1,4 @@
-# app/retrieval/retriever.py  (TE LO DEJO IGUAL, no tocamos lógica aquí)
+# app/retrieval/retriever.py
 from typing import Dict, List, Any, Optional
 import re
 
@@ -25,6 +25,12 @@ class Retriever:
         self.embedder = embedder
 
     def retrieve(self, question: str, expand_articles: bool = True) -> Dict[str, List[RetrievedItem]]:
+        """
+        IMPORTANTE (nuevo flujo):
+        - FAQs: igual (top_k_faq_candidates)
+        - Artículos: devolvemos SOLO 8 candidatos iniciales (top_k_articles_final),
+          luego el rerank se hace fuera (chatbot) con pregunta original.
+        """
         emb = self.embedder.embed_one(question)
         if not emb:
             return {"faqs": [], "articles": []}
@@ -39,17 +45,17 @@ class Retriever:
         faqs = [self._to_item("faq", r) for r in faqs_raw]
         faqs = sorted(faqs, key=lambda x: x.score, reverse=True)
 
-        # ---- Artículos: 1) global ----
+        # ---- Artículos: SOLO 8 candidatos ----
         arts_raw = self.pc.query(
             namespace=self.cfg.namespace_articles,
             embedding=emb,
-            top_k=self.cfg.top_k_articles_candidates,
+            top_k=self.cfg.top_k_articles_final,
             flt=None,
         )
         arts = [self._to_item("article", r) for r in arts_raw]
         arts = sorted(arts, key=lambda x: x.score, reverse=True)
 
-        # ---- Artículos: 2) expansión (mismo block_id del ganador) ----
+        # Expansión opcional (en este proyecto la hacemos desde chatbot)
         if expand_articles:
             arts = self._expand_articles_same_block(embedding=emb, initial=arts)
 
@@ -76,6 +82,12 @@ class Retriever:
         )
 
     def _expand_articles_same_block(self, embedding: List[float], initial: List[RetrievedItem]) -> List[RetrievedItem]:
+        """
+        NUEVO (alineado con tu flujo):
+        - Tomamos el anchor = initial[0] (ya rerankeado fuera)
+        - Buscamos TODOS los chunks del mismo block_id con top_k=40
+        - Devolvemos orden estable por (article_id, chunk_index)
+        """
         if not initial:
             return []
 
@@ -83,13 +95,11 @@ class Retriever:
         meta = anchor.meta or {}
 
         anchor_block_id = safe_str(meta.get("block_id")).strip()
-        anchor_article_id = safe_str(meta.get("article_id")).strip()
-
         if not anchor_block_id:
-            return initial[: self.cfg.top_k_articles_final]
+            return initial[: self.cfg.top_k_articles_block_context]
 
-        pool_k = getattr(self.cfg, "top_k_articles_within_article", 60) or 60
-        pool_k = max(pool_k, 60)
+        pool_k = int(getattr(self.cfg, "top_k_articles_within_block", 40) or 40)
+        pool_k = max(pool_k, 40)
 
         flt: Dict[str, Any] = {"block_id": {"$eq": anchor_block_id}}
 
@@ -101,6 +111,7 @@ class Retriever:
         )
         items = [self._to_item("article", r) for r in raw]
 
+        # dedupe + incluir anchor
         by_key: Dict[str, RetrievedItem] = {}
         for it in items:
             by_key[self._article_key(it)] = it
@@ -109,8 +120,8 @@ class Retriever:
         items = list(by_key.values())
         items = self._sort_article_chunks(items)
 
-        hard_cap = max(int(self.cfg.top_k_articles_block_context or 15), 15)
-        hard_cap = max(hard_cap, 15)
+        hard_cap = int(self.cfg.top_k_articles_block_context or 40)
+        hard_cap = max(hard_cap, 1)
         return items[:hard_cap]
 
     def _sort_article_chunks(self, items: List[RetrievedItem]) -> List[RetrievedItem]:
