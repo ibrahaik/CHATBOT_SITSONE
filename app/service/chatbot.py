@@ -100,7 +100,7 @@ def _extract_debug_faqs(items: list, kind: str, limit: int) -> List[Dict[str, An
             "kind": kind,
             "score": float(it.score or 0.0),
             "question": meta.get("question"),
-            "text_preview": _clip(it.text, 260),
+            "text_preview": _clip(it.text, 220),
         })
     return out
 
@@ -109,46 +109,17 @@ def _extract_debug_articles(items: list, kind: str, limit: int) -> List[Dict[str
     out = []
     for it in (items or [])[:limit]:
         meta = it.meta or {}
+        raw = it.text or ""
         out.append({
             "kind": kind,
             "score": float(it.score or 0.0),
             "titulo": meta.get("titulo"),
             "chunk_index": meta.get("chunk_index"),
             "block_id": meta.get("block_id"),
-            "text_preview": _clip(it.text, 260),
+            "text_preview": _clip(raw, 220),  # RAW para inspección
+            "text_clean": _clip(ContextBuilder.clean_article_text(raw), 220),  # CLEAN como lo ve el LLM
         })
     return out
-
-
-# --------- NUEVO: helpers de tema/pantalla ---------
-
-_SCREEN_RE = re.compile(r"(?:pantalla|screen)\s+([^\n\?]+)", re.IGNORECASE)
-
-def _extract_screen_name(text: str) -> str:
-    t = (text or "").strip()
-    if not t:
-        return ""
-
-    # Caso explícito "pantalla X"
-    m = _SCREEN_RE.search(t)
-    if m:
-        return m.group(1).strip(" \"'”")
-
-    # Heurística mínima (NO inventar): si el texto menciona claramente el nombre
-    tl = t.lower()
-    if "gestió" in tl and "lliur" in tl:
-        return "Gestió de lliuraments"
-
-    return ""
-
-
-def _should_update_topic(q: str) -> bool:
-    ql = (q or "").lower()
-    # Solo si hay señal de "tema real", no por longitud
-    return any(k in ql for k in ["pantalla", "mòdul", "módulo", "gestió", "gestio", "lliur", "provisionals"])
-
-
-# --------------------------------------------------
 
 
 class ChatbotService:
@@ -180,13 +151,8 @@ class ChatbotService:
         if last_user and not state.get("root_question"):
             state["root_question"] = last_user
 
-        # screen_hint persistente si lo detectamos
-        detected_screen = _extract_screen_name(last_user) or _extract_screen_name(state.get("last_bot", ""))
-        if detected_screen:
-            state["screen_hint"] = detected_screen
-
-        # topic_question: NO se pisa con “ahí/esto”
-        if last_user and _should_update_topic(last_user):
+        # topic_question: solo si hay señal de tema (no deícticos tipo "esto")
+        if last_user and self._should_update_topic(last_user):
             state["topic_question"] = last_user
 
         last_bot = self._last_bot_message(messages)
@@ -196,27 +162,24 @@ class ChatbotService:
         state["last_user"] = last_user
         memory = self._build_memory_text(state)
 
-        # --------- NUEVO: rewriter siempre salvo primer turno ---------
-        is_first_turn = not bool(state.get("last_bot"))  # si no hay last_bot, asumimos 1er turno real
-        effective_question = last_user
-        rewrite_used = False
+        # --------- effective_question = KEYWORDS EN CATALÁN ---------
+        # - siempre usamos el rewriter para obtener keywords en catalán
+        # - NO usamos screen_hint (eliminado)
+        effective_question = self.query_rewriter.rewrite(
+            last_user=last_user,
+            topic_question=state.get("topic_question") or "",
+            last_bot=state.get("last_bot") or "",
+            lang=lang,
+            screen_hint="",  # ignorado por diseño
+            root_question=state.get("root_question") or "",
+        )
+        rewrite_used = True
+        # ----------------------------------------------------------
 
-        if not is_first_turn:
-            effective_question = self.query_rewriter.rewrite(
-                last_user=last_user,
-                topic_question=state.get("topic_question") or "",
-                last_bot=state.get("last_bot") or "",
-                lang=lang,
-                screen_hint=state.get("screen_hint") or "",
-                root_question=state.get("root_question") or "",
-            )
-            rewrite_used = True
-        # ------------------------------------------------------------
-
-        # 1) retrieval usando effective_question (reescrita)
+        # 1) retrieval usando effective_question (keywords)
         res = self.retriever.retrieve(effective_question, expand_articles=False)
         faqs, arts = res["faqs"], res["articles"]
-        arts_global = list(arts)  # <-- NUEVO snapshot
+        arts_global = list(arts)
         decision = self.decider.decide(effective_question, lang, faqs, arts)
 
         # 2) judge FAQs (solo si el decider eligió FAQ)
@@ -235,7 +198,6 @@ class ChatbotService:
                     "answer": safe_str(it.text),
                 })
 
-            # ✅ CLAVE: el judge debe ver la pregunta efectiva (con pantalla)
             judge_res = self.faq_judge.select(effective_question, candidates, lang)
             ids = set(judge_res.selected_ids)
 
@@ -252,13 +214,13 @@ class ChatbotService:
                 "selected_count": len(selected_faqs),
             }
 
-            # Si el juez no ve evidencia, usamos top FAQs sin cambiar la decision
             if not selected_faqs:
                 selected_faqs = faqs[: self.cfg.top_k_faq_final]
                 if judge_debug is not None:
                     judge_debug["fallback_used"] = True
 
-        arts_expanded = []
+        # expand por block_id del ganador (se mantiene igual)
+        arts_expanded: List[Any] = []
         if decision.source_kind == "article":
             arts_expanded = self.retriever.expand_articles(effective_question, arts)
             arts = arts_expanded
@@ -278,7 +240,7 @@ class ChatbotService:
         source_line = _pick_source_line(lang, decision, faqs_for_ctx, arts_for_ctx)
 
         raw_answer = self.llm.run(
-            last_user,  # OJO: aquí mantengo last_user para responder al usuario como tal
+            last_user,  # respondemos en el idioma del usuario
             lang,
             rag_context,
             decision,
@@ -289,6 +251,9 @@ class ChatbotService:
         answer = _enforce_source_line(raw_answer, source_line) if (rag_context and source_line) else (raw_answer or "").strip()
         state["last_bot"] = answer
 
+        block_limit = int(self.cfg.top_k_articles_block_context or 15)
+
+        # Debug más compacto (evita “ruido sin sentido”)
         return {
             "language": lang,
             "decision": {"action": decision.action, "reason": decision.reason, "source_kind": decision.source_kind},
@@ -296,34 +261,43 @@ class ChatbotService:
             "state": state,
             "debug": {
                 "original_last_user": last_user,
-                "effective_question": effective_question,
+                "effective_question": effective_question,   # keywords en catalán
                 "rewrite_used": rewrite_used,
-                "screen_hint": state.get("screen_hint"),
-                "topic_question": state.get("topic_question"),
                 "faq_judge": judge_debug,
-                "faqs": {
-                    "candidates": _extract_debug_faqs(faqs, "faq", self.cfg.top_k_faq_candidates),
-                    "selected": _extract_debug_faqs(faqs_for_ctx, "faq_selected", self.cfg.top_k_faq_final),
-                },
                 "articles": {
-                "global_candidates": _extract_debug_articles(arts_global, "article_global", self.cfg.top_k_articles_candidates),
-                "expanded_pool": _extract_debug_articles(arts_expanded, "article_expanded", self.cfg.top_k_articles_final),
-                "cited_chunks": _extract_debug_articles(arts_for_ctx, "article_cited", self.cfg.top_k_articles_final),
-},
-
+                    "global_candidates": _extract_debug_articles(
+                        arts_global, "article_global", min(self.cfg.top_k_articles_candidates, 12)
+                    ),
+                    "expanded_pool": _extract_debug_articles(
+                        arts_expanded, "article_expanded", min(block_limit, 15)
+                    ),
+                    "cited_chunks": _extract_debug_articles(
+                        arts_for_ctx, "article_cited", min(block_limit, 15)
+                    ),
+                },
+                "faqs": {
+                    "candidates": _extract_debug_faqs(
+                        faqs, "faq", min(self.cfg.top_k_faq_candidates, 8)
+                    ),
+                    "selected": _extract_debug_faqs(
+                        faqs_for_ctx, "faq_selected", min(self.cfg.top_k_faq_final, 5)
+                    ),
+                },
             },
         }
+
+    def _should_update_topic(self, q: str) -> bool:
+        ql = (q or "").lower()
+        return any(k in ql for k in ["pantalla", "mòdul", "módulo", "gestió", "gestio", "lliur", "provisionals", "cartes", "retorns", "deneg"])
 
     def _build_memory_text(self, state: Dict[str, Any]) -> str:
         parts = ["MEMORIA (último hilo):"]
         if state.get("root_question"):
-            parts.append(f"- Pregunta raíz: {_clip(state['root_question'], 280)}")
-        if state.get("screen_hint"):
-            parts.append(f"- Pantalla/tema: {_clip(state['screen_hint'], 140)}")
+            parts.append(f"- Pregunta raíz: {_clip(state['root_question'], 220)}")
         if state.get("last_bot"):
-            parts.append(f"- Última respuesta del bot: {_clip(state['last_bot'], 420)}")
+            parts.append(f"- Última respuesta del bot: {_clip(state['last_bot'], 360)}")
         if state.get("last_user"):
-            parts.append(f"- Último mensaje del usuario: {_clip(state['last_user'], 280)}")
+            parts.append(f"- Último mensaje del usuario: {_clip(state['last_user'], 220)}")
         return "\n".join(parts).strip()
 
     def _last_user_message(self, messages: List[Dict[str, str]]) -> str:

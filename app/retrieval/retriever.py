@@ -1,4 +1,4 @@
-# app/retrieval/retriever.py
+# app/retrieval/retriever.py  (TE LO DEJO IGUAL, no tocamos lógica aquí)
 from typing import Dict, List, Any, Optional
 import re
 
@@ -10,7 +10,6 @@ from app.utils import safe_str
 
 _WORD_RE = re.compile(r"[A-Za-zÀ-ÿ0-9_]+", re.UNICODE)
 
-
 def _to_int(x: Any, default: Optional[int] = None) -> Optional[int]:
     try:
         if x is None:
@@ -18,7 +17,6 @@ def _to_int(x: Any, default: Optional[int] = None) -> Optional[int]:
         return int(str(x).strip())
     except Exception:
         return default
-
 
 class Retriever:
     def __init__(self, cfg: RAGConfig, pc: PineconeGateway, embedder: Embedder):
@@ -51,7 +49,7 @@ class Retriever:
         arts = [self._to_item("article", r) for r in arts_raw]
         arts = sorted(arts, key=lambda x: x.score, reverse=True)
 
-        # ---- Artículos: 2) EXPANSIÓN SIMPLE: traer TODOS los chunks del mismo block_id que el ganador ----
+        # ---- Artículos: 2) expansión (mismo block_id del ganador) ----
         if expand_articles:
             arts = self._expand_articles_same_block(embedding=emb, initial=arts)
 
@@ -77,10 +75,6 @@ class Retriever:
             meta=meta,
         )
 
-    # -------------------------------------------------------------------
-    # PRUEBA SIMPLE (LO QUE PIDES):
-    # Devuelve TODOS los chunks cuyo block_id == block_id del artículo ganador.
-    # -------------------------------------------------------------------
     def _expand_articles_same_block(self, embedding: List[float], initial: List[RetrievedItem]) -> List[RetrievedItem]:
         if not initial:
             return []
@@ -92,22 +86,12 @@ class Retriever:
         anchor_article_id = safe_str(meta.get("article_id")).strip()
 
         if not anchor_block_id:
-            # si por lo que sea no hay block_id, no podemos hacer esta prueba
             return initial[: self.cfg.top_k_articles_final]
 
-        # cuánto traer: para debug conviene que sea alto (p.ej. 50-100)
-        # si no tienes env var, usamos TOP_K_ARTICLES_WITHIN_ARTICLE o 60
         pool_k = getattr(self.cfg, "top_k_articles_within_article", 60) or 60
         pool_k = max(pool_k, 60)
 
-        # Filtro: por block_id. (Opcional: también article_id por robustez)
-        # Como block_id ya suele incluir el article_id ("13_b3"), article_id es redundante,
-        # pero lo dejamos activable por si tenéis blocks no únicos.
         flt: Dict[str, Any] = {"block_id": {"$eq": anchor_block_id}}
-
-        # Si quieres forzar que sea el mismo artículo también, descomenta:
-        # if anchor_article_id:
-        #     flt["article_id"] = {"$eq": anchor_article_id}
 
         raw = self.pc.query(
             namespace=self.cfg.namespace_articles,
@@ -117,20 +101,16 @@ class Retriever:
         )
         items = [self._to_item("article", r) for r in raw]
 
-        # Dedupe estable por (article_id, chunk_index, block_id, role)
         by_key: Dict[str, RetrievedItem] = {}
         for it in items:
             by_key[self._article_key(it)] = it
-        by_key[self._article_key(anchor)] = anchor  # asegurar anchor incluido
+        by_key[self._article_key(anchor)] = anchor
 
         items = list(by_key.values())
-
-        # Orden final: por chunk_index asc (y si falta, al final)
         items = self._sort_article_chunks(items)
 
-        # No recortes demasiado en esta prueba: devuelve todo el bloque (pero con un límite “razonable”)
-        # Si quieres ver TODO en debug, sube este límite.
-        hard_cap = max(getattr(self.cfg, "top_k_articles_final", 8) * 10, 80)
+        hard_cap = max(int(self.cfg.top_k_articles_block_context or 15), 15)
+        hard_cap = max(hard_cap, 15)
         return items[:hard_cap]
 
     def _sort_article_chunks(self, items: List[RetrievedItem]) -> List[RetrievedItem]:

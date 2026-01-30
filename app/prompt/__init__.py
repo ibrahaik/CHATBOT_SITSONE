@@ -52,7 +52,7 @@ def user_prompt(question: str, context: str, decision: Decision, memory: str = "
     ).strip()
 
 class LLMResponder:
-    def __init__(self, cfg: RAGConfig, client: OpenAI):
+    def __init__(self, cfg: RAGConfig, client: OpenAI): 
         self.cfg = cfg
         self.client = client
 

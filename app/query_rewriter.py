@@ -1,37 +1,57 @@
 # app/query_rewriter.py
 import json
-from typing import Optional
+import re
+from typing import Optional, List, Dict, Any
 from openai import OpenAI
 
-REWRITE_PROMPT = """
-Eres un asistente que reescribe preguntas para búsqueda.
+# Extrae KEYWORDS en catalán, sin responder, sin frases largas.
+KEYWORDS_PROMPT = """
+Ets un assistent que transforma una conversa en paraules clau per a cerca semàntica.
 
-OBJETIVO:
-Dada una conversación, genera UNA sola pregunta auto-contenida
-que represente exactamente lo que el usuario quiere saber ahora.
+OBJECTIU:
+Donada la conversa, retorna NOMÉS paraules clau (keywords) en CATALÀ, curtes i útils per cercar a Pinecone.
 
-REGLAS:
-- NO respondas la pregunta.
-- NO expliques nada.
-- NO inventes información.
-- Devuelve SOLO JSON válido: {"standalone_question": "..."}.
-- Si la pregunta usa referencias deícticas (p. ej. "esta pantalla", "aquí", "esto", "ahí", "la anterior"),
-  debes resolverlas usando el CONTEXTO (pantalla/tema) proporcionado.
-- Si hay un nombre de pantalla disponible, INCLÚYELO literalmente en la pregunta final.
+REGLLES:
+- NO responguis la pregunta.
+- NO expliquis res.
+- NO inventis informació.
+- Retorna NOMÉS JSON vàlid amb aquesta forma:
+  {"keywords_ca":["...","...","..."]}
 
-FORMATO:
-{"standalone_question":"..."}
+- Sempre en català (encara que l'usuari escrigui en castellà).
+- Mantén literalment sigles i termes tècnics (p.ex. "IPF", "DNI", "NIE", "PDF", "Word", "Excel").
+- Si la pregunta és massa curta o deíctica ("i això?", "i notificades?"), incorpora 1–3 keywords del context disponible
+  (root_question / topic_question / last_bot) però SENSE afegir frases.
+- 4 a 10 keywords màxim. Sense duplicats. Sense punts finals.
+- No afegeixis "pantalla/tema:" ni parèntesis ni textos llargs.
 """.strip()
 
-DEICTIC_MARKERS = (
-    "esta pantalla", "esa pantalla", "esta", "eso", "esto",
-    "aquí", "ahi", "ahí", "allí",
-    "la anterior", "lo anterior", "lo de antes",
-    "esa", "ese", "eso de", "en esa", "en esa pantalla", "en esta", "en esta pantalla",
-    "aqui", "acá", "aca",
-)
+# Heurística mínima si el model retorna mal JSON
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÿ0-9_]+", re.UNICODE)
+
+def _fallback_keywords_ca(text: str, max_k: int = 8) -> List[str]:
+    t = (text or "").strip()
+    toks = _WORD_RE.findall(t)
+    # fallback ultra simple: lower + uniques preservant ordre
+    seen = set()
+    out = []
+    for w in toks:
+        wl = w.lower()
+        if wl in seen:
+            continue
+        seen.add(wl)
+        out.append(wl)
+        if len(out) >= max_k:
+            break
+    return out
 
 class QueryRewriter:
+    """
+    ATENCIÓ:
+    - Abans: reescrivia a pregunta standalone.
+    - Ara: genera un 'effective_question' com a keywords en català, separades per comes.
+    """
+
     def __init__(self, client: OpenAI, model: str):
         self.client = client
         self.model = model
@@ -42,37 +62,27 @@ class QueryRewriter:
         topic_question: Optional[str] = "",
         last_bot: Optional[str] = "",
         lang: str = "es",
-        screen_hint: Optional[str] = "",
+        screen_hint: Optional[str] = "",   # ignorat per disseny
         root_question: Optional[str] = "",
     ) -> str:
-
         lu = (last_user or "").strip()
-        needs_anchor = any(m in lu.lower() for m in DEICTIC_MARKERS)
 
         user_block = f"""
-IDIOMA: {lang}
+IDIOMA_ULTIM_MISSATGE: {lang}
 
-CONTEXTO DE PANTALLA / TEMA (si existe):
-- screen_hint: {screen_hint or "(ninguno)"}
-- root_question: {root_question or "(ninguna)"}
-
-PREGUNTA ACTUAL DEL USUARIO:
+PREGUNTA ACTUAL (usuari):
 {lu}
 
-PREGUNTA COMPLETA ANTERIOR (si existe):
-{topic_question or "(ninguna)"}
-
-ÚLTIMA RESPUESTA DEL BOT (si ayuda):
-{(last_bot or "")[:400]}
-
-NOTA:
-needs_anchor={needs_anchor}
+CONTEXTE (si ajuda per desambiguar preguntes curtes):
+- root_question: {root_question or "(cap)"}
+- topic_question: {topic_question or "(cap)"}
+- last_bot (retallat): {(last_bot or "")[:400]}
 """.strip()
 
         resp = self.client.chat.completions.create(
             model=self.model,
             messages=[
-                {"role": "system", "content": REWRITE_PROMPT},
+                {"role": "system", "content": KEYWORDS_PROMPT},
                 {"role": "user", "content": user_block},
             ],
             temperature=0.0,
@@ -82,14 +92,32 @@ needs_anchor={needs_anchor}
 
         try:
             data = json.loads(text)
-            q = (data.get("standalone_question") or lu).strip()
+            kws = data.get("keywords_ca") or []
+            if not isinstance(kws, list):
+                kws = []
+            # neteja
+            cleaned = []
+            seen = set()
+            for k in kws:
+                ks = str(k).strip()
+                if not ks:
+                    continue
+                ksl = ks.lower()
+                if ksl in seen:
+                    continue
+                seen.add(ksl)
+                cleaned.append(ks)
+                if len(cleaned) >= 10:
+                    break
 
-            # Cinturón y tirantes: si sigue deíctico y hay ancla, lo forzamos.
-            if needs_anchor and (screen_hint or root_question):
-                anchor = (screen_hint or root_question).strip()
-                if anchor and anchor.lower() not in q.lower():
-                    # no lo hagas feo: añade literal y compacto
-                    q = f"{q} (sobre: {anchor})"
-            return q or lu
+            if cleaned:
+                # efectiu: keywords separades per comes (string curt)
+                return ", ".join(cleaned)
+
+            # fallback si JSON però buit
+            fb = _fallback_keywords_ca(" ".join([lu, topic_question or "", root_question or ""]), max_k=8)
+            return ", ".join(fb) if fb else lu
+
         except Exception:
-            return lu
+            fb = _fallback_keywords_ca(" ".join([lu, topic_question or "", root_question or ""]), max_k=8)
+            return ", ".join(fb) if fb else lu
