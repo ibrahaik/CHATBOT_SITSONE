@@ -10,7 +10,7 @@ def system_prompt(lang: str) -> str:
         "2) Si el usuario mezcla idiomas, responde en el idioma predominante del último mensaje.\n"
         "3) Si no está claro, responde en español.\n\n"
         "ESTILO:\n"
-        "- Tono cercano y natural. Directo.\n"
+        "- Tono cercano, natural y con energía (profesional, sin exagerar)\n"
         "- Prioriza ayudar a usar la aplicación y resolver dudas concretas.\n"
         "- Por defecto 1–4 frases. Si el usuario pide pasos, usa lista numerada.\n"
         "- No cierres con 'Si quieres dime...'. Da el siguiente paso útil.\n"
@@ -52,7 +52,7 @@ def user_prompt(question: str, context: str, decision: Decision, memory: str = "
     ).strip()
 
 class LLMResponder:
-    def __init__(self, cfg: RAGConfig, client: OpenAI): 
+    def __init__(self, cfg: RAGConfig, client: OpenAI):
         self.cfg = cfg
         self.client = client
 

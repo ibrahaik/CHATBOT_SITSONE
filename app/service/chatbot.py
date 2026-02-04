@@ -27,33 +27,38 @@ def _ym(iso: str) -> str:
     return f"{dt.year:04d}-{dt.month:02d}"
 
 
-def _faq_theme_until_first_dot(question: str) -> str:
+def _faq_theme_until_second_dot(question: str) -> str:
+    """
+    Extrae el "tema" del FAQ hasta el segundo punto.
+    Ej:
+      "FAQs T-metropolitana. CANVI DE TARGETA ROSA A T-METROPOLITANA. 1. ..." =>
+      "FAQs T-metropolitana. CANVI DE TARGETA ROSA A T-METROPOLITANA."
+    """
     q = (question or "").strip()
-    return q.split(".", 1)[0].strip() if q else ""
+    if not q:
+        return ""
 
+    parts = q.split(".")
+    # Queremos: "A. B." (dos primeros segmentos con su punto)
+    if len(parts) >= 3:
+        a = parts[0].strip()
+        b = parts[1].strip()
+        if a and b:
+            return f"{a}. {b}."
 
-def _faq_ref(meta: Dict[str, Any]) -> str:
-    fid = safe_str(meta.get("faq_id")).strip()
-    if fid:
-        return fid
-    row = meta.get("source_row")
-    if row is not None and str(row).strip():
-        return f"row {row}"
-    fp = safe_str(meta.get("fingerprint")).strip()
-    if fp:
-        return f"fp {fp[:10]}"
-    return ""
+    # Fallback: si solo hay 1 punto
+    if len(parts) >= 2 and parts[0].strip():
+        return f"{parts[0].strip()}."
+
+    return q
 
 
 def _pick_source_line(lang: str, decision: Decision, faqs: list, arts: list) -> str:
     if decision.source_kind == "faq" and faqs:
         meta = faqs[0].meta or {}
         base = "Font: FAQ" if lang == "ca" else "Source: FAQ" if lang == "en" else "Fuente: FAQ"
-        ref = _faq_ref(meta)
-        theme = _faq_theme_until_first_dot(safe_str(meta.get("question")))
+        theme = _faq_theme_until_second_dot(safe_str(meta.get("question")))
         out = base
-        if ref:
-            out += f" {ref}"
         if theme:
             out += f" — {theme}"
         return out.strip()
@@ -96,12 +101,14 @@ def _extract_debug_faqs(items: list, kind: str, limit: int) -> List[Dict[str, An
     out = []
     for it in (items or [])[:limit]:
         meta = it.meta or {}
-        out.append({
-            "kind": kind,
-            "score": float(it.score or 0.0),
-            "question": meta.get("question"),
-            "text_preview": _clip(it.text, 260),
-        })
+        out.append(
+            {
+                "kind": kind,
+                "score": float(it.score or 0.0),
+                "question": meta.get("question"),
+                "text_preview": _clip(it.text, 260),
+            }
+        )
     return out
 
 
@@ -110,14 +117,16 @@ def _extract_debug_articles(items: list, kind: str, limit: int) -> List[Dict[str
     for it in (items or [])[:limit]:
         meta = it.meta or {}
         raw = it.text or ""
-        out.append({
-            "kind": kind,
-            "score": float(it.score or 0.0),
-            "titulo": meta.get("titulo"),
-            "chunk_index": meta.get("chunk_index"),
-            "block_id": meta.get("block_id"),
-            "text_preview": _clip(raw, 260),  # ✅ solo RAW
-        })
+        out.append(
+            {
+                "kind": kind,
+                "score": float(it.score or 0.0),
+                "titulo": meta.get("titulo"),
+                "chunk_index": meta.get("chunk_index"),
+                "block_id": meta.get("block_id"),
+                "text_preview": _clip(raw, 260),  # solo RAW
+            }
+        )
     return out
 
 
@@ -223,17 +232,20 @@ class ChatbotService:
                 fid = safe_str((it.meta or {}).get("faq_id")).strip()
                 if not fid:
                     continue
-                candidates.append({
-                    "id": fid,
-                    "question": safe_str((it.meta or {}).get("question")),
-                    "answer": safe_str(it.text),
-                })
+                candidates.append(
+                    {
+                        "id": fid,
+                        "question": safe_str((it.meta or {}).get("question")),
+                        "answer": safe_str(it.text),
+                    }
+                )
 
             judge_res = self.faq_judge.select(effective_question, candidates, lang)
             ids = set(judge_res.selected_ids)
 
             selected_faqs = [
-                it for it in faqs
+                it
+                for it in faqs
                 if safe_str((it.meta or {}).get("faq_id")).strip() in ids
             ][: self.cfg.top_k_faq_final]
 
