@@ -232,7 +232,7 @@ def _is_deictic(text: str) -> bool:
         return True
 
     # preguntas extremadamente vagas tipo "¿y?" / "¿por qué?"
-    if len(toks) <= 2 and any(w in {"porque", "por", "qué", "que", "why", "how"} for w in toks):
+    if len(toks) <= 2 and any(w in {"porque", "por", "qué", "que", "why", "how", "qué", "que", "como", "cómo", "dónde", "cuando", "cuándo", "por qué", "porque", "esto", "eso", "aquí", "ahí", "vale", "ok", "y", "entonces"} for w in toks):
         return True
 
     return False
