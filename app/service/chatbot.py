@@ -132,14 +132,21 @@ class ChatbotService:
         lang = detect_language(last_user)
 
         # -------- rewriter manda --------
-        effective_question = last_user
+        effective_question = (last_user or "").strip()
         rewrite_used = False
+        rw = None
 
-        if last_bot:
-            effective_question = self.query_rewriter.rewrite(
+        # Usa last_bot REAL del chat si existe; si no, usa el guardado en state
+        last_bot_ctx = (last_bot or state.get("last_bot") or "").strip()
+
+        if last_bot_ctx:
+            rw = self.query_rewriter.rewrite(
                 last_user=last_user,
-                last_bot=last_bot,
+                last_bot=last_bot_ctx,
+                lang=lang,
             )
+            # COMPAT: tu dataclass usa effective_query
+            effective_question = (rw.effective_query or "").strip() or effective_question
             rewrite_used = True
 
         # -------- retrieval --------
@@ -220,6 +227,19 @@ class ChatbotService:
 
         state["last_bot"] = answer
 
+        # debug rewrite seguro
+        rewrite_debug = None
+        if rw is not None:
+            rewrite_debug = {
+                "mode": rw.mode,
+                "use_context": rw.use_context,
+                "confidence": rw.confidence,
+                "clarify": rw.clarify,
+                "clarify_question_es": rw.clarify_question_es,
+                "keywords_ca": rw.keywords_ca,
+                "effective_query": rw.effective_query,
+            }
+
         return {
             "language": lang,
             "decision": {
@@ -233,6 +253,7 @@ class ChatbotService:
                 "original_last_user": last_user,
                 "effective_question": effective_question,
                 "rewrite_used": rewrite_used,
+                "rewrite": rewrite_debug,
                 "faq_judge": judge_debug,
                 "faqs": _extract_debug(faqs_for_ctx, "faq", self.cfg.top_k_faq_final),
                 "articles": {
