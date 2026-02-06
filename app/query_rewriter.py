@@ -19,12 +19,10 @@ REGLLES (molt estrictes)
   {"keywords_ca":["...","..."]}
 
 COM EXTREURE KEYWORDS
-- Prioritza paraules que JA apareixen a la pregunta de l’usuari.
-- No afegeixis sinònims ni paraules “decoratives”.
+- Prioritza paraules que JA apareixen a la pregunta actual de l’usuari.
+- NO afegeixis sinònims ni paraules “decoratives”.
 - Mantén literals sigles/termes: "IPF", "DNI", "NIE", "PDF", "Word", "Excel", etc.
-- Si la pregunta és massa curta o deíctica (ex: "i això?", "notificades?", "aquí?"),
-  llavors i NOMÉS llavors pots afegir 1–3 keywords del context (root_question / topic_question / last_bot),
-  però sense frases, només paraules.
+- Si hi ha CONTEXTE, usa’l NOMÉS per desambiguar i només amb 1–3 paraules clau extra.
 - 2 a 8 keywords màxim. Sense duplicats. Sense punts finals.
 - No afegeixis "pantalla", "títol", ni noms de pantalla si l’usuari NO ho ha dit explícitament.
 """.strip()
@@ -45,6 +43,7 @@ def _fallback_keywords(text: str, max_k: int = 6) -> List[str]:
             break
     return out
 
+
 class QueryRewriter:
     """
     Devuelve effective_question como keywords en catalán (string separado por comas).
@@ -61,7 +60,7 @@ class QueryRewriter:
         last_bot: Optional[str] = "",
         lang: str = "es",
         screen_hint: Optional[str] = "",  # ignorado
-        root_question: Optional[str] = "",
+        root_question: Optional[str] = "",  # ignorado (compat)
     ) -> str:
         lu = (last_user or "").strip()
 
@@ -69,8 +68,7 @@ class QueryRewriter:
 PREGUNTA ACTUAL (usuari):
 {lu}
 
-CONTEXTE (només per desambiguar si la pregunta és curta/deíctica):
-- root_question: {root_question or "(cap)"}
+CONTEXTE (opcional; pot ser buit):
 - topic_question: {topic_question or "(cap)"}
 - last_bot (retallat): {(last_bot or "")[:400]}
 """.strip()

@@ -39,14 +39,12 @@ def _faq_theme_until_second_dot(question: str) -> str:
         return ""
 
     parts = q.split(".")
-    # Queremos: "A. B." (dos primeros segmentos con su punto)
     if len(parts) >= 3:
         a = parts[0].strip()
         b = parts[1].strip()
         if a and b:
             return f"{a}. {b}."
 
-    # Fallback: si solo hay 1 punto
     if len(parts) >= 2 and parts[0].strip():
         return f"{parts[0].strip()}."
 
@@ -131,7 +129,6 @@ def _extract_debug_articles(items: list, kind: str, limit: int) -> List[Dict[str
 
 
 # --------- helpers de tema/pantalla ---------
-# Solo aceptar "pantalla ..." explícito, y si no, NO inventar.
 _SCREEN_RE = re.compile(r"(?im)\b(?:pantalla|screen)\b\s*[:\-]?\s*([^\n\?]+)")
 
 
@@ -150,6 +147,135 @@ def _extract_screen_name(text: str) -> str:
 def _should_update_topic(q: str) -> bool:
     ql = (q or "").lower()
     return any(k in ql for k in ["pantalla", "mòdul", "módulo", "gestió", "gestio", "lliur", "provisionals"])
+
+
+# --------- NUEVO: detección de follow-up (sin IA) ---------
+_WORD_RE = re.compile(r"[A-Za-zÀ-ÿ0-9_]+", re.UNICODE)
+
+_DEICTIC_TOKENS = {
+    # ES
+    "esto", "eso", "esa", "ese", "aqui", "aquí", "ahi", "ahí", "alli", "allí",
+    "asi", "así", "entonces", "vale", "ok", "ojo",
+    "lo", "la", "los", "las", "ello",
+    "tambien", "también",
+    # CA
+    "aixo", "això", "aqui", "aquí", "alla", "allà", "ahi", "ahí",
+    "doncs", "vale", "dacord", "d'acord",
+    # EN (por si acaso)
+    "this", "that", "here", "there", "then",
+}
+
+# tokens típicos “de seguimiento” muy frecuentes
+_FOLLOWUP_PATTERNS = [
+    r"^(y\s+)?(entonces|vale|ok)\b",
+    r"^(i\s+)?(això|aixo|doncs)\b",
+    r"^(y\s+)?eso\b",
+    r"^(y\s+)?esto\b",
+    r"^(i\s+)?aquí\b",
+    r"^(y\s+)?aquí\b",
+    r"^(y\s+)?ahí\b",
+    r"^\?$",
+]
+_FOLLOWUP_RE = re.compile("|".join(_FOLLOWUP_PATTERNS), re.IGNORECASE)
+
+# entidades “claras” mínimas (si aparecen, asumimos tema nuevo)
+_ENTITY_HINTS = [
+    "pantalla", "screen",
+    "t-metropolitana", "tmetropolitana", "t-metropolitana", "rosa", "tarjeta rosa", "passe acompanyant", "pase acompañante"
+    "ipf", "dni", "nie", "passaport", "pasaporte",
+    "t4", "t-4",
+    "amb", "tmb", "atm",
+    "carta", "cartes", "denegació", "denegacion", "denegació",
+    "provisional", "provisionals",
+]
+
+
+def _has_clear_entities(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    tl = t.lower()
+
+    # contiene algún “hint” del dominio
+    if any(h in tl for h in _ENTITY_HINTS):
+        return True
+
+    # tiene números o formato tipo "1.6", "2.2", etc.
+    if re.search(r"\b\d+(\.\d+)+\b", t):
+        return True
+
+    # tiene acrónimos (IPF, DNI, etc.) o tokens con mayúsculas tipo "TMB"
+    toks = _WORD_RE.findall(t)
+    for w in toks:
+        if len(w) >= 2 and w.isupper():
+            return True
+
+    return False
+
+
+def _is_short(text: str, max_words: int = 4) -> bool:
+    toks = _WORD_RE.findall((text or "").strip())
+    return 0 < len(toks) <= max_words
+
+
+def _is_deictic(text: str) -> bool:
+    t = (text or "").strip()
+    if not t:
+        return False
+
+    if _FOLLOWUP_RE.search(t):
+        return True
+
+    toks = [w.lower() for w in _WORD_RE.findall(t)]
+    if any(w in _DEICTIC_TOKENS for w in toks):
+        return True
+
+    # preguntas extremadamente vagas tipo "¿y?" / "¿por qué?"
+    if len(toks) <= 2 and any(w in {"porque", "por", "qué", "que", "why", "how"} for w in toks):
+        return True
+
+    return False
+
+
+def _should_use_context(last_user: str) -> bool:
+    """
+    Contexto SOLO si:
+      - pregunta corta, o deíctica
+      Y
+      - NO hay entidades claras
+    """
+    lu = (last_user or "").strip()
+    if not lu:
+        return False
+
+    if _has_clear_entities(lu):
+        return False
+
+    return _is_short(lu, max_words=4) or _is_deictic(lu)
+
+
+# --------- NUEVO: recorte/limpieza de last_bot ---------
+_CLOSINGS_RE = re.compile(
+    r"(?is)\b(si\s+necesitas.*?$|si\s+vols.*?$|if\s+you\s+need.*?$|do\s+you\s+have.*?$)\s*",
+    re.UNICODE,
+)
+
+def _clean_last_bot_for_context(text: str, max_chars: int = 280) -> str:
+    t = (text or "").strip()
+    if not t:
+        return ""
+
+    # quitar source line y similares
+    t = _SOURCE_LINE_RE.sub("", t).strip()
+
+    # quitar cierres típicos
+    t = _CLOSINGS_RE.sub("", t).strip()
+
+    # colapsar espacios
+    t = re.sub(r"\s+", " ", t).strip()
+
+    return _clip(t, max_chars)
 
 
 # --------------------------------------------------
@@ -180,22 +306,18 @@ class ChatbotService:
         last_user = self._last_user_message(messages)
         lang = detect_language(last_user)
 
-        # root_question solo una vez
-        if last_user and not state.get("root_question"):
-            state["root_question"] = last_user
-
         # screen_hint persistente SOLO si se detecta explícitamente (pantalla X)
         detected_screen = _extract_screen_name(last_user) or _extract_screen_name(state.get("last_bot", ""))
         if detected_screen:
             state["screen_hint"] = detected_screen
 
-        # topic_question: NO se pisa con “ahí/esto”
+        # topic_question: solo si el usuario realmente menciona tema/pantalla
         if last_user and _should_update_topic(last_user):
             state["topic_question"] = last_user
 
-        last_bot = self._last_bot_message(messages)
-        if last_bot:
-            state["last_bot"] = last_bot
+        last_bot_prev = self._last_bot_message(messages)
+        if last_bot_prev:
+            state["last_bot"] = last_bot_prev
 
         state["last_user"] = last_user
         memory = self._build_memory_text(state)
@@ -204,15 +326,26 @@ class ChatbotService:
         is_first_turn = not bool(state.get("last_bot"))
         effective_question = last_user
         rewrite_used = False
+        used_context = False
 
         if not is_first_turn:
+            use_ctx = _should_use_context(last_user)
+            used_context = use_ctx
+
+            topic_for_rewrite = state.get("topic_question") or ""
+            last_bot_for_rewrite = _clean_last_bot_for_context(state.get("last_bot") or "") if use_ctx else ""
+
+            # si NO toca contexto, vaciamos también topic (evita contaminación)
+            if not use_ctx:
+                topic_for_rewrite = ""
+
             effective_question = self.query_rewriter.rewrite(
                 last_user=last_user,
-                topic_question=state.get("topic_question") or "",
-                last_bot=state.get("last_bot") or "",
+                topic_question=topic_for_rewrite,
+                last_bot=last_bot_for_rewrite,
                 lang=lang,
                 screen_hint=state.get("screen_hint") or "",
-                root_question=state.get("root_question") or "",
+                root_question="",  # NO usamos root_question
             )
             rewrite_used = True
 
@@ -304,6 +437,7 @@ class ChatbotService:
                 "original_last_user": last_user,
                 "effective_question": effective_question,
                 "rewrite_used": rewrite_used,
+                "rewrite_used_context": used_context,
                 "screen_hint": state.get("screen_hint"),
                 "topic_question": state.get("topic_question"),
                 "faq_judge": judge_debug,
@@ -321,10 +455,10 @@ class ChatbotService:
 
     def _build_memory_text(self, state: Dict[str, Any]) -> str:
         parts = ["MEMORIA (último hilo):"]
-        if state.get("root_question"):
-            parts.append(f"- Pregunta raíz: {_clip(state['root_question'], 280)}")
         if state.get("screen_hint"):
             parts.append(f"- Pantalla/tema: {_clip(state['screen_hint'], 140)}")
+        if state.get("topic_question"):
+            parts.append(f"- Último tema explícito: {_clip(state['topic_question'], 280)}")
         if state.get("last_bot"):
             parts.append(f"- Última respuesta del bot: {_clip(state['last_bot'], 420)}")
         if state.get("last_user"):
